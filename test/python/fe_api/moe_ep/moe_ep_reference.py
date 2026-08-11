@@ -123,7 +123,9 @@ class BlockScaledTensor:
             expected_scale_dtype = _require_torch_dtype("float8_e8m0fnu")
             data_shape = self.logical_shape
             if self.data.dtype != expected_dtype:
-                raise TypeError(f"mxfp8 data must have dtype {expected_dtype}, got {self.data.dtype}")
+                raise TypeError(
+                    f"mxfp8 data must have dtype {expected_dtype}, got {self.data.dtype}"
+                )
         else:
             expected_scale_dtype = _require_torch_dtype("float8_e4m3fn")
             fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
@@ -295,25 +297,33 @@ def _decode_tensor(
     name: str,
     expected_shape: Tuple[int, ...],
     quantized_axis: int,
+    dtype: torch.dtype,
 ) -> torch.Tensor:
     if isinstance(tensor, BlockScaledTensor):
         if tensor.logical_shape != expected_shape:
-            raise ValueError(f"{name} logical shape must be {expected_shape}, got {tensor.logical_shape}")
+            raise ValueError(
+                f"{name} logical shape must be {expected_shape}, got {tensor.logical_shape}"
+            )
         if tensor.axis != _normalize_axis(quantized_axis, len(expected_shape)):
             raise ValueError(f"{name} must be block-scaled along axis {quantized_axis}")
-        return tensor.dequantize()
+        return tensor.dequantize(dtype=dtype)
 
     if tuple(tensor.shape) != expected_shape:
         raise ValueError(f"{name} shape must be {expected_shape}, got {tuple(tensor.shape)}")
     if not tensor.is_floating_point():
         raise TypeError(f"{name} must be floating point or BlockScaledTensor, got {tensor.dtype}")
-    return tensor.float()
+    return tensor.to(dtype=dtype)
 
 
-def _format_round_trip(tensor: torch.Tensor, format: MoeFormat) -> torch.Tensor:
+def _format_round_trip(
+    tensor: torch.Tensor,
+    format: MoeFormat,
+    *,
+    dtype: torch.dtype,
+) -> torch.Tensor:
     if format is MoeFormat.BF16:
-        return tensor.to(torch.bfloat16).float()
-    return quantize_blockwise(tensor, format, axis=-1).dequantize()
+        return tensor.to(torch.bfloat16).to(dtype)
+    return quantize_blockwise(tensor, format, axis=-1).dequantize(dtype=dtype)
 
 
 class MoeEpReference:
@@ -339,6 +349,7 @@ class MoeEpReference:
         apply_topk_in_fc1: bool = True,
         gate_up_clamp: Optional[float] = None,
         generate_c: bool = False,
+        compute_dtype: torch.dtype = torch.float32,
     ) -> None:
         for name, value in (
             ("num_experts", num_experts),
@@ -352,16 +363,25 @@ class MoeEpReference:
             raise ValueError(f"top_k ({top_k}) cannot exceed num_experts ({num_experts})")
         if max_tokens_per_rank is not None and max_tokens_per_rank < 0:
             raise ValueError("max_tokens_per_rank must be non-negative")
+        if compute_dtype not in (torch.float32, torch.bfloat16):
+            raise ValueError(
+                "compute_dtype must be torch.float32 or torch.bfloat16, "
+                f"got {compute_dtype}"
+            )
 
         if ep_group is None:
             ep_size, ep_rank = 1, 0
         else:
             if not dist.is_available() or not dist.is_initialized():
-                raise RuntimeError("ep_group requires an initialized torch.distributed process group")
+                raise RuntimeError(
+                    "ep_group requires an initialized torch.distributed process group"
+                )
             ep_size = dist.get_world_size(ep_group)
             ep_rank = dist.get_rank(ep_group)
         if num_experts % ep_size != 0:
-            raise ValueError(f"num_experts ({num_experts}) must be divisible by EP size ({ep_size})")
+            raise ValueError(
+                f"num_experts ({num_experts}) must be divisible by EP size ({ep_size})"
+            )
 
         self.num_experts = num_experts
         self.hidden_size = hidden_size
@@ -377,11 +397,20 @@ class MoeEpReference:
         self.apply_topk_in_fc1 = bool(apply_topk_in_fc1)
         self.gate_up_clamp = None if gate_up_clamp is None else abs(float(gate_up_clamp))
         self.generate_c = bool(generate_c)
+        self.compute_dtype = compute_dtype
 
-        for name, fmt in (("output_format", self.output_format), ("combine_format", self.combine_format)):
-            required_multiple = 32 if fmt is MoeFormat.MXFP8 else 16 if fmt is MoeFormat.NVFP4 else 1
+        for name, fmt in (
+            ("output_format", self.output_format),
+            ("combine_format", self.combine_format),
+        ):
+            required_multiple = (
+                32 if fmt is MoeFormat.MXFP8 else 16 if fmt is MoeFormat.NVFP4 else 1
+            )
             if hidden_size % required_multiple != 0:
-                raise ValueError(f"hidden_size ({hidden_size}) must be divisible by {required_multiple} for {name}={fmt.value}")
+                raise ValueError(
+                    f"hidden_size ({hidden_size}) must be divisible by {required_multiple} for"
+                    f" {name}={fmt.value}"
+                )
 
     def __repr__(self) -> str:
         return (
@@ -389,7 +418,8 @@ class MoeEpReference:
             f"experts={self.num_experts}, local_experts={self.experts_per_rank}, "
             f"hidden={self.hidden_size}, intermediate={self.intermediate_size}, "
             f"top_k={self.top_k}, ep_rank={self.ep_rank}/{self.ep_size}, "
-            f"output={self.output_format.value}, combine={self.combine_format.value})"
+            f"output={self.output_format.value}, combine={self.combine_format.value}, "
+            f"compute_dtype={self.compute_dtype})"
         )
 
     def _collective_device(self, device: torch.device) -> torch.device:
@@ -456,7 +486,9 @@ class MoeEpReference:
         destination = torch.div(expert, self.experts_per_rank, rounding_mode="floor")
         order = torch.argsort(destination, stable=True)
 
-        send_counts_tensor = torch.bincount(destination.index_select(0, order), minlength=self.ep_size).to(torch.int64)
+        send_counts_tensor = torch.bincount(
+            destination.index_select(0, order), minlength=self.ep_size
+        ).to(torch.int64)
         recv_counts_tensor = self._exchange_counts(send_counts_tensor)
         return _DispatchPlan(
             send_expert=expert.index_select(0, order).remainder(self.experts_per_rank),
@@ -477,7 +509,7 @@ class MoeEpReference:
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         output = torch.empty(
             (tokens.shape[0], self.hidden_size),
-            dtype=torch.float32,
+            dtype=self.compute_dtype,
             device=tokens.device,
         )
         fc1_c_rows = [] if self.generate_c else None
@@ -501,11 +533,21 @@ class MoeEpReference:
             expert_output = intermediate @ fc2_weight[expert]
             if not self.apply_topk_in_fc1:
                 expert_output = expert_output * weights
-            expert_output = _format_round_trip(expert_output, self.combine_format)
+            expert_output = _format_round_trip(
+                expert_output,
+                self.combine_format,
+                dtype=self.compute_dtype,
+            )
             output.index_copy_(0, positions, expert_output)
         fc1_c = None
         if fc1_c_rows is not None:
-            fc1_c = torch.cat(fc1_c_rows) if fc1_c_rows else torch.empty((0, 2 * self.intermediate_size), dtype=torch.bfloat16, device=tokens.device)
+            fc1_c = (
+                torch.cat(fc1_c_rows)
+                if fc1_c_rows
+                else torch.empty(
+                    (0, 2 * self.intermediate_size), dtype=torch.bfloat16, device=tokens.device
+                )
+            )
         return output, fc1_c
 
     def __call__(
@@ -543,13 +585,17 @@ class MoeEpReference:
         if tuple(topk_idx.shape) != route_shape:
             raise ValueError(f"topk_idx shape must be {route_shape}, got {tuple(topk_idx.shape)}")
         if tuple(topk_weights.shape) != route_shape:
-            raise ValueError(f"topk_weights shape must be {route_shape}, got {tuple(topk_weights.shape)}")
+            raise ValueError(
+                f"topk_weights shape must be {route_shape}, got {tuple(topk_weights.shape)}"
+            )
         if topk_idx.dtype not in (torch.int32, torch.int64):
             raise TypeError(f"topk_idx must be int32 or int64, got {topk_idx.dtype}")
         if not topk_weights.is_floating_point():
             raise TypeError(f"topk_weights must be floating point, got {topk_weights.dtype}")
         if self.max_tokens_per_rank is not None and token_count > self.max_tokens_per_rank:
-            raise ValueError(f"token count {token_count} exceeds max_tokens_per_rank={self.max_tokens_per_rank}")
+            raise ValueError(
+                f"token count {token_count} exceeds max_tokens_per_rank={self.max_tokens_per_rank}"
+            )
 
         device = _tensor_device(activation)
         inputs = {
@@ -567,18 +613,21 @@ class MoeEpReference:
             name="activation",
             expected_shape=(token_count, self.hidden_size),
             quantized_axis=1,
+            dtype=self.compute_dtype,
         )
         fc1_float = _decode_tensor(
             fc1_weight,
             name="fc1_weight",
             expected_shape=(self.experts_per_rank, self.hidden_size, 2 * self.intermediate_size),
             quantized_axis=1,
+            dtype=self.compute_dtype,
         )
         fc2_float = _decode_tensor(
             fc2_weight,
             name="fc2_weight",
             expected_shape=(self.experts_per_rank, self.intermediate_size, self.hidden_size),
             quantized_axis=1,
+            dtype=self.compute_dtype,
         )
 
         plan = self._dispatch_plan(topk_idx, topk_weights)
@@ -589,7 +638,9 @@ class MoeEpReference:
 
         recv_tokens = self._all_to_all(send_tokens, send_counts, recv_counts)
         recv_expert = self._all_to_all(plan.send_expert, send_counts, recv_counts)
-        recv_weight = self._all_to_all(plan.send_weight, send_counts, recv_counts)
+        recv_weight = self._all_to_all(plan.send_weight, send_counts, recv_counts).to(
+            dtype=self.compute_dtype
+        )
 
         route_metadata = None
         if self.generate_c:
@@ -602,7 +653,11 @@ class MoeEpReference:
             # Stable sort by local expert reproduces the fc1_c row order
             # (grouped by expert; source order preserved within each group).
             fc1_c_order = torch.argsort(recv_expert, stable=True)
-            route_metadata = torch.stack((recv_expert, recv_src_rank, recv_token, recv_slot), dim=1).index_select(0, fc1_c_order).to(torch.int32)
+            route_metadata = (
+                torch.stack((recv_expert, recv_src_rank, recv_token, recv_slot), dim=1)
+                .index_select(0, fc1_c_order)
+                .to(torch.int32)
+            )
         # recv rows are ordered by source rank, then that source's token-major
         # route order, so the per-expert position grouping below realizes the
         # documented fc1_c ordering.
@@ -617,7 +672,7 @@ class MoeEpReference:
         returned = self._all_to_all(recv_output, recv_counts, send_counts)
         combine_plane = torch.zeros(
             (token_count * self.top_k, self.hidden_size),
-            dtype=torch.float32,
+            dtype=self.compute_dtype,
             device=device,
         )
         send_flat_slot = send_token_idx * self.top_k + send_slot_idx
@@ -656,14 +711,22 @@ class MoeEpReference:
         ``grad_output`` is the ``(T, H)`` gradient of the dequantized output.
 
         Returns ``(grad_activation, grad_fc1_weight, grad_fc2_weight,
-        grad_topk_weights)`` in float32.
+        grad_topk_weights)``. Activation and expert weight gradients use
+        ``compute_dtype``. Router weights are cast to ``compute_dtype`` for the
+        activation scaling path; the returned
+        ``grad_topk_weights`` remain float32.
         """
 
         if not self.generate_c:
-            raise RuntimeError("backward requires the operator to be constructed with generate_c=True")
+            raise RuntimeError(
+                "backward requires the operator to be constructed with generate_c=True"
+            )
         token_count = topk_idx.shape[0]
         if tuple(grad_output.shape) != (token_count, self.hidden_size):
-            raise ValueError(f"grad_output shape must be {(token_count, self.hidden_size)}, got {tuple(grad_output.shape)}")
+            raise ValueError(
+                f"grad_output shape must be {(token_count, self.hidden_size)}, got"
+                f" {tuple(grad_output.shape)}"
+            )
         if not grad_output.is_floating_point():
             raise TypeError(f"grad_output must be floating point, got {grad_output.dtype}")
 
@@ -674,30 +737,43 @@ class MoeEpReference:
             name="activation",
             expected_shape=(token_count, self.hidden_size),
             quantized_axis=1,
+            dtype=self.compute_dtype,
         )
         fc1_float = _decode_tensor(
             fc1_weight,
             name="fc1_weight",
             expected_shape=(self.experts_per_rank, self.hidden_size, two_i),
             quantized_axis=1,
+            dtype=self.compute_dtype,
         )
         fc2_float = _decode_tensor(
             fc2_weight,
             name="fc2_weight",
             expected_shape=(self.experts_per_rank, self.intermediate_size, self.hidden_size),
             quantized_axis=1,
+            dtype=self.compute_dtype,
         )
         if fc1_c.shape != (int(route_metadata.shape[0]), two_i):
-            raise ValueError(f"fc1_c shape must be {(int(route_metadata.shape[0]), two_i)}, got {tuple(fc1_c.shape)}")
+            raise ValueError(
+                f"fc1_c shape must be {(int(route_metadata.shape[0]), two_i)}, got"
+                f" {tuple(fc1_c.shape)}"
+            )
 
         # Re-dispatch the FC1 inputs, router weights, and output gradients
         # along the identical forward routes.
         plan = self._dispatch_plan(topk_idx, topk_weights)
         send_counts, recv_counts = plan.send_counts, plan.recv_counts
-        grad_output_float = grad_output.float()
-        recv_tokens = self._all_to_all(activation_float.index_select(0, plan.send_token_idx), send_counts, recv_counts)
-        recv_weight = self._all_to_all(plan.send_weight, send_counts, recv_counts)
-        recv_grad = self._all_to_all(grad_output_float.index_select(0, plan.send_token_idx), send_counts, recv_counts)
+        grad_output_float = grad_output.to(dtype=self.compute_dtype)
+        recv_tokens = self._all_to_all(
+            activation_float.index_select(0, plan.send_token_idx), send_counts, recv_counts
+        )
+        # Same FP32-on-wire / compute_dtype-for-activation cast as forward.
+        recv_weight = self._all_to_all(plan.send_weight, send_counts, recv_counts).to(
+            dtype=self.compute_dtype
+        )
+        recv_grad = self._all_to_all(
+            grad_output_float.index_select(0, plan.send_token_idx), send_counts, recv_counts
+        )
 
         # route_metadata rows are in fc1_c order; sorting them by
         # (src_rank, src_token, src_slot) reproduces the receive order, giving
@@ -717,9 +793,13 @@ class MoeEpReference:
         dy_rows = torch.empty_like(recv_grad)
         dy_rows.index_copy_(0, perm, recv_grad)
 
-        c_rows = fc1_c.float()
+        c_rows = fc1_c.to(dtype=self.compute_dtype)
         expert_rows = metadata[:, 0]
-        d_x_rows = torch.zeros((local_routes, self.hidden_size), dtype=torch.float32, device=device)
+        d_x_rows = torch.zeros(
+            (local_routes, self.hidden_size),
+            dtype=self.compute_dtype,
+            device=device,
+        )
         d_w_rows = torch.zeros((local_routes,), dtype=torch.float32, device=device)
         grad_fc1 = torch.zeros_like(fc1_float)
         grad_fc2 = torch.zeros_like(fc2_float)
@@ -752,10 +832,17 @@ class MoeEpReference:
             d_h_fc2 = d_y_pre @ fc2_float[expert].transpose(0, 1)
             if self.apply_topk_in_fc1:
                 d_h = d_h_fc2 * w
-                d_w_rows[positions] = (d_h_fc2 * h).sum(dim=-1)
+                d_w_rows[positions] = (
+                    (d_h_fc2 * h).sum(dim=-1).to(dtype=self.compute_dtype).float()
+                )
             else:
                 d_h = d_h_fc2
-                d_w_rows[positions] = (d_y * (h @ fc2_float[expert])).sum(dim=-1)
+                d_w_rows[positions] = (
+                    (d_y * (h @ fc2_float[expert]))
+                    .sum(dim=-1)
+                    .to(dtype=self.compute_dtype)
+                    .float()
+                )
 
             d_g = d_h * u * (sig * (1 + g * (1 - sig)))
             d_u = d_h * s
@@ -771,10 +858,18 @@ class MoeEpReference:
         # Return the route gradients to their source ranks and scatter-add.
         returned_dx = self._all_to_all(d_x_rows.index_select(0, perm), recv_counts, send_counts)
         returned_dw = self._all_to_all(d_w_rows.index_select(0, perm), recv_counts, send_counts)
-        grad_activation = torch.zeros((token_count, self.hidden_size), dtype=torch.float32, device=device)
+        grad_activation = torch.zeros(
+            (token_count, self.hidden_size),
+            dtype=self.compute_dtype,
+            device=device,
+        )
         grad_activation.index_add_(0, plan.send_token_idx, returned_dx)
-        grad_topk_weights = torch.zeros((token_count * self.top_k,), dtype=torch.float32, device=device)
-        grad_topk_weights.index_copy_(0, plan.send_token_idx * self.top_k + plan.send_slot_idx, returned_dw)
+        grad_topk_weights = torch.zeros(
+            (token_count * self.top_k,), dtype=torch.float32, device=device
+        )
+        grad_topk_weights.index_copy_(
+            0, plan.send_token_idx * self.top_k + plan.send_slot_idx, returned_dw
+        )
         return (
             grad_activation,
             grad_fc1,
@@ -790,3 +885,4 @@ __all__ = [
     "MoeTensor",
     "quantize_blockwise",
 ]
+
