@@ -1025,7 +1025,7 @@ def test_activation_scale_rows_are_padded_to_16_bytes():
             kernel_shared_workspace_bytes=128,
         )
     activation_scale = next(region for region in requirements.symmetric_regions if region.name == "activation_scale")
-    assert activation_scale.nbytes == 5 * 16
+    assert activation_scale.nbytes == 128 * 16
 
 
 @pytest.mark.L0

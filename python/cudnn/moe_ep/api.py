@@ -435,6 +435,17 @@ class MoeEp:
 
         return self._training_lanes
 
+    def training_symmetric_buffers(
+        self,
+        lane: MoeEpExecutionLane,
+    ) -> Mapping[str, torch.Tensor]:
+        """Return one lane's symmetric MXFP8 input and final-output buffers."""
+
+        with self._lifecycle_lock:
+            self._require_training_lane(lane)
+            assert self._training_state is not None
+            return self._training_state.public_symmetric_buffers(lane.index)
+
     def prepare_training(
         self,
         *,
@@ -446,8 +457,9 @@ class MoeEp:
     ]:
         """Collectively prepare private training runtime and return contracts.
 
-        ``device`` defaults to the current CUDA device. No weights or caller
-        output buffers are retained by the operator.
+        ``device`` defaults to the current CUDA device. No weights are retained.
+        Per-lane symmetric input and final-output buffers are available through
+        :meth:`training_symmetric_buffers`.
         """
 
         with self._lifecycle_lock:
