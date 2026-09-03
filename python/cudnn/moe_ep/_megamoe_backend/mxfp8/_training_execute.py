@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import torch
 
+from ..._math import round_up
 from ..._types import (
     BlockScaledTensor,
     MoeEpNativeBackwardWeights,
@@ -77,7 +78,7 @@ def _activation_views(
         _typed_view(
             workspace.symmetric["activation_scale"],
             torch.float8_e8m0fnu,
-            (capacity, padded_mxfp8_scale_columns(hidden)),
+            (round_up(capacity, 128), padded_mxfp8_scale_columns(hidden)),
         ),
     )
 
