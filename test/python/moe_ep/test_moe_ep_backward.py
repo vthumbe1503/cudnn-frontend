@@ -820,7 +820,7 @@ def test_training_methods_require_prepare_and_do_not_expose_cleanup():
 
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
-def test_stateless_training_ep1_eager_and_cuda_graph_match_reference():
+def test_stateless_training_padded_capacity_eager_and_cuda_graph_match_reference():
     device = _sm107_device()
     base_args = make_forward_inputs(device)
     args = (
@@ -838,13 +838,15 @@ def test_stateless_training_ep1_eager_and_cuda_graph_match_reference():
         gate_up_clamp=None,
     )
     source_weights = _fixed_training_weights(args)
+    capacity = args[0].shape[0] + 1
+    assert capacity % 128 != 0
 
     with MoeEp(
         num_experts=2,
         hidden_size=128,
         intermediate_size=256,
         top_k=2,
-        max_tokens_per_rank=args[0].shape[0],
+        max_tokens_per_rank=capacity,
         max_recv_size_per_rank=args[0].shape[0] * args[3].shape[1],
         drop_on_overflow=True,
         combine_format="bf16",
@@ -861,10 +863,13 @@ def test_stateless_training_ep1_eager_and_cuda_graph_match_reference():
             out=backward_staging,
         )
         lane = op.training_lanes[0]
+        symmetric = op.training_symmetric_buffers(lane)
+        assert symmetric["forward_input_scale"].shape[0] == 128
+        assert symmetric["backward_input_scale"].shape[0] == 128
         forward_out, backward_out = _allocate_stateless_training_outputs(
             requirements,
             device,
-            op.training_symmetric_buffers(lane),
+            symmetric,
         )
 
         def run():

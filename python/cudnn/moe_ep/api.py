@@ -856,9 +856,11 @@ class MoeEp:
                     with torch.cuda.device(device):
                         state = backend.prepare_training(lane_count=1)
                         requirements = state.public_requirements()
+                        symmetric_buffers = state.public_symmetric_buffers(0)
                         forward_out, backward_out = allocate_training_outputs(
                             requirements,
                             device,
+                            symmetric_buffers,
                         )
                         forward_names = (
                             "output",
